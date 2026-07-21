@@ -121,6 +121,8 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, d
         # --- Training Phase ---
         model.train()
         total_loss = 0.0
+        correct_train = 0
+        total_train = 0
         
         for batch_idx, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
@@ -133,11 +135,17 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, d
             
             total_loss += loss.item()
             
+            # Track training accuracy
+            _, predicted_classes = torch.max(outputs, dim=1)
+            total_train += labels.size(0)
+            correct_train += (predicted_classes == labels).sum().item()
+            
             # Print batch progress every 20 batches
             if (batch_idx + 1) % 20 == 0 or (batch_idx + 1) == len(train_loader):
                 print(f"Epoch {epoch+1}/{epochs} | Batch {batch_idx+1}/{len(train_loader)} | Loss: {loss.item():.4f}")
                 
         avg_train_loss = total_loss / len(train_loader)
+        train_accuracy = (correct_train / total_train) * 100.0
         
         # --- Validation Phase ---
         model.eval()
@@ -156,7 +164,7 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, d
                 
         val_accuracy = (correct_val / total_val) * 100.0
         
-        print(f"--- Epoch {epoch+1} Summary | Train Loss: {avg_train_loss:.4f} | Validation Accuracy: {val_accuracy:.2f}% ---")
+        print(f"--- Epoch {epoch+1} Summary | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}% | Val Acc: {val_accuracy:.2f}% ---")
 
 def evaluate_model(model, dataloader, device):
     """Final dedicated evaluation on the test set."""
@@ -204,7 +212,6 @@ if __name__ == "__main__":
     print(f"Total Trainable Parameters (Quantum + Classical): {total_params}")
 
     print("\nStarting Training Loop...")
-    # We pass the test_loader in as the val_loader so it computes metrics after each epoch
     train_model(model, train_loader, test_loader, optimizer, criterion, EPOCHS, device)
 
     print("\nStarting Final Evaluation Loop...")
