@@ -79,19 +79,15 @@ def hybrid_qcnn_circuit(inputs, conv_params, pool_params, fc_params):
     qml.AmplitudeEmbedding(features=inputs, wires=range(8), normalize=True)
     
     # --- Local Quantum Convolutional Layer ---
-    # 15 parameters shared across adjacent pairs
     local_quantum_conv_layer(conv_params, wires=range(8))
     
     # --- Quantum Pooling Layer ---
-    # Reduces 8 qubits to 4 active target qubits
     quantum_pooling_layer(pool_params, source_wires=[1, 3, 5, 7], target_wires=[0, 2, 4, 6])
     
     # --- Quantum Fully Connected Layer ---
-    # Strongly entangling layout over the remaining 4 qubits
     qml.StronglyEntanglingLayers(fc_params, wires=[0, 2, 4, 6])
     
     # --- Hybrid Readout ---
-    # Return 4 continuous expectation values to feed the classical Dense layer
     return [qml.expval(qml.PauliZ(w)) for w in [0, 2, 4, 6]]
 
 # ==========================================
@@ -101,38 +97,32 @@ class HybridQCNNMNIST(nn.Module):
     def __init__(self):
         super().__init__()
         
-        # 15 parameters for the SU(4) convolutional filter
         self.conv_params = nn.Parameter(torch.rand(15) * 2 * torch.pi)
-        
-        # 3 parameters for the controlled-rotation pooling
         self.pool_params = nn.Parameter(torch.rand(3) * 2 * torch.pi)
-        
-        # Strongly entangling layers require shape (num_layers, num_wires, 3)
         self.fc_params = nn.Parameter(torch.rand(1, 4, 3) * 2 * torch.pi)
         
-        # Classical projection mapping 4 expectation values to 10 class logits
         self.classical_dense = nn.Linear(in_features=4, out_features=10)
 
     def forward(self, x):
         # The QNode natively broadcasts across the batch dimension.
-        # Outputs shape: (4, batch_size) -> Transposed to (batch_size, 4)
         quantum_expectations = torch.stack(
             hybrid_qcnn_circuit(x, self.conv_params, self.pool_params, self.fc_params)
         ).T 
         
-        # Generate the 10 raw logits
         logits = self.classical_dense(quantum_expectations)
-        
         return logits
 
 # ==========================================
 # 5. Training and Evaluation Pipeline
 # ==========================================
-def train_model(model, dataloader, optimizer, criterion, epochs, device):
-    model.train()
+def train_model(model, train_loader, val_loader, optimizer, criterion, epochs, device):
     for epoch in range(epochs):
+        
+        # --- Training Phase ---
+        model.train()
         total_loss = 0.0
-        for batch_idx, (images, labels) in enumerate(dataloader):
+        
+        for batch_idx, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
             
             optimizer.zero_grad()
@@ -143,13 +133,33 @@ def train_model(model, dataloader, optimizer, criterion, epochs, device):
             
             total_loss += loss.item()
             
-            if (batch_idx + 1) % 20 == 0 or (batch_idx + 1) == len(dataloader):
-                print(f"Epoch {epoch+1}/{epochs} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f}")
+            # Print batch progress every 20 batches
+            if (batch_idx + 1) % 20 == 0 or (batch_idx + 1) == len(train_loader):
+                print(f"Epoch {epoch+1}/{epochs} | Batch {batch_idx+1}/{len(train_loader)} | Loss: {loss.item():.4f}")
                 
-        avg_loss = total_loss / len(dataloader)
-        print(f"--- Epoch {epoch+1} Completed | Average Loss: {avg_loss:.4f} ---")
+        avg_train_loss = total_loss / len(train_loader)
+        
+        # --- Validation Phase ---
+        model.eval()
+        correct_val = 0
+        total_val = 0
+        
+        with torch.no_grad():
+            for val_images, val_labels in val_loader:
+                val_images, val_labels = val_images.to(device), val_labels.to(device)
+                
+                val_outputs = model(val_images)
+                _, predicted_classes = torch.max(val_outputs, dim=1)
+                
+                total_val += val_labels.size(0)
+                correct_val += (predicted_classes == val_labels).sum().item()
+                
+        val_accuracy = (correct_val / total_val) * 100.0
+        
+        print(f"--- Epoch {epoch+1} Summary | Train Loss: {avg_train_loss:.4f} | Validation Accuracy: {val_accuracy:.2f}% ---")
 
 def evaluate_model(model, dataloader, device):
+    """Final dedicated evaluation on the test set."""
     model.eval()
     correct_predictions = 0
     total_samples = 0
@@ -166,7 +176,7 @@ def evaluate_model(model, dataloader, device):
             
     accuracy = (correct_predictions / total_samples) * 100.0
     print("=====================================")
-    print(f"Hybrid Local QCNN Clean Test Accuracy: {accuracy:.2f}%")
+    print(f"Final Hybrid QCNN Test Accuracy: {accuracy:.2f}%")
     print("=====================================")
     return accuracy
 
@@ -187,7 +197,6 @@ if __name__ == "__main__":
     print("Initializing Hybrid QCNN Model...")
     model = HybridQCNNMNIST().to(device)
     
-    # CrossEntropyLoss automatically applies Softmax internally to the classical logits
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -195,7 +204,8 @@ if __name__ == "__main__":
     print(f"Total Trainable Parameters (Quantum + Classical): {total_params}")
 
     print("\nStarting Training Loop...")
-    train_model(model, train_loader, optimizer, criterion, EPOCHS, device)
+    # We pass the test_loader in as the val_loader so it computes metrics after each epoch
+    train_model(model, train_loader, test_loader, optimizer, criterion, EPOCHS, device)
 
-    print("\nStarting Evaluation Loop on 10,000 Test Images...")
+    print("\nStarting Final Evaluation Loop...")
     evaluate_model(model, test_loader, device)
