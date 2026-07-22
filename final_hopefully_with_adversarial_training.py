@@ -1,0 +1,263 @@
+import pennylane as qml
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
+
+# ==========================================
+# 1. High-Throughput Data Loading
+# ==========================================
+def prepare_mnist_dataloaders(batch_size: int, max_train_samples: int = 60000, max_test_samples: int = 10000):
+    transform = transforms.Compose([
+        transforms.Resize((16, 16)),
+        transforms.ToTensor()
+    ])
+
+    train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=4)
+
+    return train_loader, test_loader
+
+# ==========================================
+# 2. Quantum Architecture
+# ==========================================
+num_qubits = 4
+dev = qml.device("default.qubit", wires=num_qubits)
+
+def full_zz_block(rot_weights, zz_weights, wires):
+    n = len(wires)
+    for i in range(n):
+        qml.Rot(rot_weights[i, 0], rot_weights[i, 1], rot_weights[i, 2], wires=wires[i])
+        
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            qml.IsingZZ(zz_weights[idx], wires=[wires[i], wires[j]])
+            idx += 1
+
+@qml.qnode(dev, interface="torch", diff_method="backprop")
+def deep_quantum_pooled_filter(inputs, l1_rot, l1_zz, pool_w, l2_rot, l2_zz):
+    for i in range(num_qubits):
+        qml.RY(inputs[:, i] * torch.pi, wires=i)
+
+    for d in range(2):
+        full_zz_block(l1_rot[d], l1_zz[d], wires=[0, 1, 2, 3])
+            
+    qml.CRot(pool_w[0, 0], pool_w[0, 1], pool_w[0, 2], wires=[1, 0])
+    qml.CRot(pool_w[1, 0], pool_w[1, 1], pool_w[1, 2], wires=[3, 2])
+
+    for d in range(2):
+        full_zz_block(l2_rot[d], l2_zz[d], wires=[0, 2])
+            
+    return [qml.expval(qml.PauliZ(w)) for w in [0, 2]]
+
+def extract_and_reshape_patches(images_batch):
+    batch_size = images_batch.shape[0]
+    patches = F.unfold(images_batch, kernel_size=2, stride=2) 
+    patches_reshaped = patches.transpose(1, 2).reshape(batch_size * 64, 4)
+    return patches_reshaped, batch_size
+
+class QuantumHeavyQuanvNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1_rot = nn.Parameter(torch.rand(2, 4, 3) * 2 * torch.pi)
+        self.l1_zz = nn.Parameter(torch.rand(2, 6) * 2 * torch.pi)
+        self.pool_w = nn.Parameter(torch.rand(2, 3) * 2 * torch.pi)
+        self.l2_rot = nn.Parameter(torch.rand(2, 2, 3) * 2 * torch.pi)
+        self.l2_zz = nn.Parameter(torch.rand(2, 1) * 2 * torch.pi)
+        self.fc = nn.Linear(in_features=128, out_features=10)
+
+    def forward(self, x):
+        batched_patches, batch_size = extract_and_reshape_patches(x)
+        quantum_out = torch.stack(
+            deep_quantum_pooled_filter(batched_patches, self.l1_rot, self.l1_zz, self.pool_w, self.l2_rot, self.l2_zz)
+        ).T 
+        flattened_features = quantum_out.reshape(batch_size, 128)
+        logits = self.fc(flattened_features)
+        return logits
+
+# ==========================================
+# 3. PGD Adversarial Attack Generator
+# ==========================================
+def pgd_attack(model, images, labels, epsilon, alpha, iters, device):
+    """
+    Generates adversarial examples using Projected Gradient Descent (PGD).
+    """
+    original_images = images.clone().detach()
+    
+    # Initialize with random noise within the epsilon ball
+    adv_images = images.clone().detach() + torch.empty_like(images).uniform_(-epsilon, epsilon)
+    adv_images = torch.clamp(adv_images, min=0, max=1).detach()
+    
+    loss_fn = nn.CrossEntropyLoss()
+
+    for _ in range(iters):
+        adv_images.requires_grad = True
+        
+        # Forward pass
+        outputs = model(adv_images)
+        loss = loss_fn(outputs, labels)
+        
+        # Backward pass
+        model.zero_grad()
+        loss.backward()
+        
+        # Update adversarial images
+        with torch.no_grad():
+            adv_images = adv_images + alpha * adv_images.grad.sign()
+            # Project back to epsilon ball
+            eta = torch.clamp(adv_images - original_images, min=-epsilon, max=epsilon)
+            adv_images = torch.clamp(original_images + eta, min=0, max=1)
+            
+        adv_images = adv_images.detach()
+
+    return adv_images
+
+# ==========================================
+# 4. Training and Evaluation Pipelines
+# ==========================================
+def train_model(model, train_loader, val_loader, optimizer, scheduler, criterion, epochs, device, 
+                is_adv_training=False, adv_eps=0.3, adv_alpha=0.075, adv_iters=10):
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        correct_train = 0
+        total_train = 0
+        
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images, labels = images.to(device), labels.to(device)
+            
+            # --- Madry et al. Adversarial Training Intervention ---
+            if is_adv_training:
+                model.eval() # Keep layers stable during attack generation
+                images = pgd_attack(model, images, labels, adv_eps, adv_alpha, adv_iters, device)
+                model.train() # Switch back to train mode for weight updates
+            
+            # Standard weight update step
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            _, predicted_classes = torch.max(outputs, dim=1)
+            total_train += labels.size(0)
+            correct_train += (predicted_classes == labels).sum().item()
+            
+            if (batch_idx + 1) % 20 == 0 or (batch_idx + 1) == len(train_loader):
+                print(f"Epoch {epoch+1}/{epochs} | Batch {batch_idx+1}/{len(train_loader)} | Loss: {loss.item():.4f}")
+                
+        avg_train_loss = total_loss / len(train_loader)
+        train_accuracy = (correct_train / total_train) * 100.0
+        
+        # Validation Phase
+        model.eval()
+        val_loss = 0.0
+        correct_val = 0
+        total_val = 0
+        
+        with torch.no_grad():
+            for val_images, val_labels in val_loader:
+                val_images, val_labels = val_images.to(device), val_labels.to(device)
+                
+                val_outputs = model(val_images)
+                batch_loss = criterion(val_outputs, val_labels)
+                val_loss += batch_loss.item()
+                
+                _, predicted_classes = torch.max(val_outputs, dim=1)
+                total_val += val_labels.size(0)
+                correct_val += (predicted_classes == val_labels).sum().item()
+                
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = (correct_val / total_val) * 100.0
+        
+        scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        print(f"--- Epoch {epoch+1} Summary | LR: {current_lr:.5f} | Train Acc: {train_accuracy:.2f}% | Clean Val Acc: {val_accuracy:.2f}% ---")
+
+def evaluate_robustness(model, dataloader, device, attack_name="Clean", epsilon=0.0, alpha=0.0, iters=10):
+    """Evaluates the model on either clean data or PGD adversarial data."""
+    model.eval()
+    correct_predictions = 0
+    total_samples = 0
+    
+    print(f"\nRunning {attack_name} Evaluation...")
+    for images, labels in dataloader:
+        images, labels = images.to(device), labels.to(device)
+        
+        if epsilon > 0.0:
+            # Generate attacks. Gradients are temporarily enabled just for the images.
+            images = pgd_attack(model, images, labels, epsilon, alpha, iters, device)
+            
+        with torch.no_grad():
+            outputs = model(images)
+            _, predicted_classes = torch.max(outputs, dim=1)
+            
+            total_samples += labels.size(0)
+            correct_predictions += (predicted_classes == labels).sum().item()
+            
+    accuracy = (correct_predictions / total_samples) * 100.0
+    print(f">> {attack_name} Test Accuracy: {accuracy:.2f}%")
+    return accuracy
+
+# ==========================================
+# 5. Main Execution Block
+# ==========================================
+if __name__ == "__main__":
+    BATCH_SIZE = 512 
+    EPOCHS = 50
+    LEARNING_RATE = 0.005
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Executing on: {device.type.upper()}")
+
+    print("Preparing Datasets...")
+    train_loader, test_loader = prepare_mnist_dataloaders(batch_size=BATCH_SIZE)
+
+    # ---------------------------------------------------------
+    # STAGE 1: STANDARD TRAINING
+    # ---------------------------------------------------------
+    print("\n" + "="*50)
+    print("STAGE 1: STANDARD TRAINING")
+    print("="*50)
+    
+    model_standard = QuantumHeavyQuanvNN().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer_std = torch.optim.Adam(model_standard.parameters(), lr=LEARNING_RATE)
+    scheduler_std = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_std, mode='min', factor=0.5, patience=5)
+
+    print("\nTraining Standard Model...")
+    train_model(model_standard, train_loader, test_loader, optimizer_std, scheduler_std, criterion, EPOCHS, device, 
+                is_adv_training=False)
+
+    evaluate_robustness(model_standard, test_loader, device, attack_name="Clean")
+    evaluate_robustness(model_standard, test_loader, device, attack_name="PGD-10 (eps=0.3)", epsilon=0.3, alpha=0.075)
+
+    # ---------------------------------------------------------
+    # STAGE 2: ADVERSARIAL TRAINING
+    # ---------------------------------------------------------
+    print("\n" + "="*50)
+    print("STAGE 2: MADRY ADVERSARIAL TRAINING")
+    print("="*50)
+    
+    # Initialize a fresh model for a fair comparison
+    model_robust = QuantumHeavyQuanvNN().to(device)
+    optimizer_rob = torch.optim.Adam(model_robust.parameters(), lr=LEARNING_RATE)
+    scheduler_rob = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_rob, mode='min', factor=0.5, patience=5)
+
+    print("\nTraining Robust Model (Expect longer step times)...")
+    train_model(model_robust, train_loader, test_loader, optimizer_rob, scheduler_rob, criterion, EPOCHS, device, 
+                is_adv_training=True, adv_eps=0.3, adv_alpha=0.075, adv_iters=10)
+
+    evaluate_robustness(model_robust, test_loader, device, attack_name="Clean")
+    evaluate_robustness(model_robust, test_loader, device, attack_name="PGD-10 (eps=0.3)", epsilon=0.3, alpha=0.075)
+    evaluate_robustness(model_robust, test_loader, device, attack_name="PGD-10 (eps=0.6)", epsilon=0.6, alpha=0.15)
+    evaluate_robustness(model_robust, test_loader, device, attack_name="PGD-10 (eps=1.0)", epsilon=1.0, alpha=0.25)
